@@ -1,0 +1,394 @@
+---
+title: "Take_home_assignment"
+author: "Vicky (Ke) Xu"
+date: "15/02/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, error = TRUE)
+```
+
+
+## City of Toronto
+## PARKS, FORESTRY & RECREATION DIVISION
+## Data Analyst & Integrator (Data Science)
+## Job ID# 13025(X)
+## Technical Assignment Result
+
+### Load all requried packages
+```{r echo=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidygeocoder)
+library(jsonlite)
+library(sp)
+library(sf)
+library(geosphere)
+library(leaflet)
+library(lubridate)
+```
+
+### The very first step is to load all parking ticket data. I took it from year 2016 to 2018.
+```{r}
+all_file_names <- list.files('parking-ticket/parking-tickets-2016/',full.name=TRUE)
+listDFs <- lapply(all_file_names, read.csv, quote='', stringsAsFactors=FALSE)
+combDFs_2016 <- do.call("rbind", listDFs)
+
+all_file_names <- list.files('parking-ticket/parking-tickets-2017/',full.name=TRUE)
+listDFs <- lapply(all_file_names, read.csv, quote='', stringsAsFactors=FALSE)
+combDFs_2017 <- do.call("rbind", listDFs)
+
+all_file_names <- list.files('parking-ticket/parking-tickets-2018/',full.name=TRUE)
+listDFs <- lapply(all_file_names, read.csv, quote='', stringsAsFactors=FALSE)
+combDFs_2018 <- do.call("rbind", listDFs)
+
+
+parking_ticket <- rbind(combDFs_2016,combDFs_2017)
+parking_ticket <- rbind(parking_ticket,combDFs_2018)
+```
+
+### Preliminary examinations on missing values
+```{r}
+# Check the number of missing values within each column
+
+parking_ticket_missing_summary <- apply(parking_ticket,2,function(x) sum(!complete.cases(x))) 
+print(parking_ticket_missing_summary)
+
+# Remove missing values and $0 set_fine_amount (there are 93 of them)
+parking_ticket <- parking_ticket[complete.cases(parking_ticket$date_of_infraction),]
+parking_ticket <- parking_ticket[complete.cases(parking_ticket$infraction_code),]
+parking_ticket <- parking_ticket[complete.cases(parking_ticket$set_fine_amount),]
+parking_ticket <- parking_ticket[parking_ticket$set_fine_amount != 0,]
+
+# Decided to leave all missing time_of_infraction as is because 
+# it is not within the objectives of this assignment.
+nrow(parking_ticket[!complete.cases(parking_ticket$time_of_infraction),])
+```
+
+
+### 3.1.1 Top 20 ticket infractions (frequency)
+```{r}
+top_20_freq <- parking_ticket %>%
+  group_by(infraction_code,infraction_description) %>%
+  summarise(freq=n()) %>%
+  arrange(desc(freq)) %>%
+  head(20) %>%
+  as.data.frame()
+top_20_freq
+```
+
+### 3.1.2 Top 20 ticket infractions (revenue)
+```{r}
+top_20_revenue <- parking_ticket %>%
+  group_by(infraction_code,infraction_description) %>%
+  summarise(revenue=sum(set_fine_amount)) %>%
+  arrange(desc(revenue)) %>%
+  head(20) %>%
+  as.data.frame()
+top_20_revenue
+```
+
+
+### 3.1.4a How far (as the crow flies) is the closest parking lot (Green P) to each of the top 20 infraction locations?
+
+```{r}
+top_20_locations <- parking_ticket %>%
+  group_by(location2) %>%
+  summarise(freq=n()) %>%
+  arrange(desc(freq)) %>%
+  head(20) %>%
+  as.data.frame()
+
+# Paste all information to make it ready for geocoding
+top_20_locations$location_new <- paste0(top_20_locations$location2,',TORONTO,ON,CANADA')
+
+# Geocode all 20 addresses using the geocode function from tidygeocoder with method='osm'
+top_20_locations_geocoded <- top_20_locations %>% 
+  tidygeocoder::geocode(location_new,method='osm')
+
+# Load green-p-parking data
+green_p <- fromJSON('green-p-parking/green-p-parking-2019.json') %>% as.data.frame()
+
+# Convert carparks.lat and carparks.lng to numeric
+green_p$carparks.lat <- as.numeric(green_p$carparks.lat)
+green_p$carparks.lng <- as.numeric(green_p$carparks.lng)
+
+# Make sure that there is no missing locations
+nrow(green_p[!complete.cases(green_p$carparks.lat),])
+nrow(green_p[!complete.cases(green_p$carparks.lng),])
+
+# Create spatial objects for top_20_locations_geocoded and green_p
+sp_top_20_locations_geocoded <- top_20_locations_geocoded
+coordinates(sp_top_20_locations_geocoded) <- ~long+lat
+
+sp_green_p <- green_p
+coordinates(sp_green_p) <- ~carparks.lng+carparks.lat
+
+# Create a new data frame with two addtional columns to store results
+top_20_locations_w_min_parking_dist <- top_20_locations_geocoded
+top_20_locations_w_min_parking_dist['min_dist_ind'] <- 0
+top_20_locations_w_min_parking_dist['min_dist'] <- 0
+
+# Loop through all 20 locaitons and find the closest parking location
+for (i in 1:20)
+{
+  dist_mat <- distm(coordinates(sp_top_20_locations_geocoded[i,]),coordinates(sp_green_p))
+  top_20_locations_w_min_parking_dist$min_dist_ind[i] <- which.min(dist_mat)
+  top_20_locations_w_min_parking_dist$min_dist[i]  <- min(dist_mat)
+}
+
+green_p_new <- green_p %>%
+  mutate(index=1:nrow(green_p))
+
+top_20_locations_w_min_parking_dist<- left_join(top_20_locations_w_min_parking_dist, 
+                                                green_p_new,by=c('min_dist_ind' = 'index')) %>%
+                                                select(-min_dist_ind)
+                                                as.data.frame()
+```
+
+
+### 3.1.4b How far (as the crow flies) is the closest TTC stop to the top 20 infraction locations?
+
+```{r}
+# Load TTC data
+ttc_stops <- read.table('TTC Routes and Schedules/opendata_ttc_schedules/stops.txt',
+                        header=TRUE,
+                        sep=',',
+                        stringsAsFactors = FALSE,
+                        quote = "")
+head(ttc_stops)
+dim(ttc_stops)
+
+ttc_stops$stop_lat <- as.numeric(ttc_stops$stop_lat)
+ttc_stops$stop_lon <- as.numeric(ttc_stops$stop_lon)
+
+sp_ttc_stops <- ttc_stops
+coordinates(sp_ttc_stops) <- ~stop_lon+stop_lat
+
+# Create two columns to store results
+top_20_locations_w_min_ttc_stops <- top_20_locations_geocoded
+top_20_locations_w_min_ttc_stops['min_dist_ind'] <- 0
+top_20_locations_w_min_ttc_stops['min_dist'] <- 0
+
+# Loop through all 20 locations and find the closest parking location
+for (i in 1:20)
+{
+  dist_mat <- distm(coordinates(sp_top_20_locations_geocoded[i,]),coordinates(sp_ttc_stops))
+  top_20_locations_w_min_ttc_stops$min_dist_ind[i] <- which.min(dist_mat)
+  top_20_locations_w_min_ttc_stops$min_dist[i]  <- min(dist_mat)
+}
+
+ttc_stops_new <- ttc_stops %>%
+  mutate(index=1:nrow(ttc_stops))
+
+top_20_locations_w_min_ttc_stops<- left_join(top_20_locations_w_min_ttc_stops, 
+                                             ttc_stops_new,by=c('min_dist_ind' = 'index')) %>%
+                                             select(-min_dist_ind) %>%
+                                             as.data.frame()
+top_20_locations_w_min_ttc_stops
+```
+
+
+### 3.1.5a Impact of day of week in all infractions
+
+```{r}
+# First create columns for weekday, month, season and year
+
+parking_ticket$month <- as.factor(month(ymd(parking_ticket$date_of_infraction)))
+parking_ticket$year <- as.factor(year(ymd(parking_ticket$date_of_infraction)))
+parking_ticket$weekday <- weekdays(as.Date(parking_ticket$date_of_infraction,
+                 tryFormats = c('%Y%m%d')))
+
+getSeason <- function(input.date){
+  numeric.date <- 100*month(input.date)+day(input.date)
+  ## input Seasons upper limits in the form MMDD in the "break =" option:
+  cuts <- base::cut(numeric.date, breaks = c(0,319,0620,0921,1220,1231)) 
+  # rename the resulting groups (could've been done within cut(...levels=) if "Winter" wasn't double
+  levels(cuts) <- c("Winter","Spring","Summer","Fall","Winter")
+  return(cuts)
+}
+parking_ticket$season <- getSeason(ymd(parking_ticket$date_of_infraction))
+
+parking_ticket %>% 
+  group_by(weekday) %>%
+  summarise(number_of_infractions = n())
+```
+
+
+### 3.1.5b Impact of month of week in all infractions
+
+```{r}
+parking_ticket %>% 
+  group_by(month) %>%
+  summarise(number_of_infractions = n())
+```
+
+
+### 3.1.5c Impact of season of week in all infractions
+
+```{r}
+parking_ticket %>% 
+  group_by(season) %>%
+  summarise(number_of_infractions = n())
+```
+
+### 3.3.1.a.i Distribution of infractions by year
+
+```{r}
+parking_ticket %>%
+  group_by(year) %>%
+  summarise(count=n()) %>%
+  ggplot(aes(x=year,y=count)) +   
+    geom_bar(aes(fill = year), position = "dodge", stat="identity")+
+    # geom_point(aes(x = year, y = count), size = 1.5, color="black", group = 2) +
+    # geom_line(aes(x = year, y = count), size = 1.5, color="red", group = 1) +
+    ylim(0,3000000) +
+    theme(legend.position = "none")
+```
+
+
+### 3.3.1.a.ii Distribution of infractions by month
+
+```{r}
+parking_ticket %>%
+  group_by(month) %>%
+  summarise(count=n()) %>%
+  ggplot(aes(x=month,y=count)) +   
+  geom_bar(aes(fill = month), position = "dodge", stat="identity")+
+  ylim(0,700000)+
+  theme(legend.position = "none")
+  # geom_point(aes(x = month, y = count), size = 1.5, color="black", group = 1) +
+  # geom_line(aes(x = month, y = count), size = 1.5, color="blue", group = 1)
+```
+
+
+### 3.3.1.b Distribution of top 20 infractions by fines
+
+```{r}
+top_20_revenue <- top_20_revenue[order(top_20_revenue$infraction_code),]
+top_20_revenue$infraction_code <- as.factor(top_20_revenue$infraction_code)
+top_20_revenue %>%
+  ggplot(aes(x=infraction_code,y=revenue)) +   
+  geom_bar(aes(fill = infraction_code), position = "dodge", stat="identity")+
+  theme(legend.position = "none")
+```
+
+
+### 3.3.2.a Geographic distribution (location) of top 20 infractions (count)
+
+```{r}
+top_20_infraction_location_map <- leaflet(sp_top_20_locations_geocoded) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  setView(lng = -79.372573, lat = 43.679434, zoom = 10) %>%
+  addMarkers(popup = paste("Address: ", sp_top_20_locations_geocoded$location2, "<br>",
+                           "Total number of infractions: ", sp_top_20_locations_geocoded$freq, "<br>"))
+top_20_infraction_location_map
+```
+
+
+### 3.3.2.b Geographic distribution by ward for top 20 infractions (count)
+### Interpretation: find the total number of infractions within each ward for all top 20 infraction locations.
+
+```{r}
+# Import City of Toronto ward
+
+sf_city_ward <- sf::st_read('City Wards/City Wards Data/City Wards Data.shp', 
+                            stringsAsFactors=F, options = "ENCODING=UTF8")
+
+city_ward_col_names <- read.csv('City Wards/City Wards Data/City Wards Data_fields.csv',
+                                stringsAsFactors = F)
+colnames(sf_city_ward) <- city_ward_col_names$name
+head(sf_city_ward)
+
+# First determine the polygon each location belongs to
+
+top_20_locations_geocoded$AREA_NAME <- apply(top_20_locations_geocoded[,c('long','lat')], 1, function(row) {  
+  # Transformation to palnar (epsg:2163) is required, since sf library assumes planar projection 
+  sf_city_ward_pl <- st_transform(sf_city_ward$geometry, 2163)
+  coords <- c(as.numeric(row[1]),as.numeric(row[2]))
+  pnt_sf <- st_transform(st_sfc(st_point(coords),crs = 4326), 2163)
+  # Use st_intersects to see which polygon does the point intersects with
+  area <- sf_city_ward[which(st_intersects(pnt_sf, sf_city_ward_pl, sparse = FALSE)), ]$AREA_NAME 
+  return(area)
+})
+
+top_20_locations_geocoded
+
+# Then create a frequency table
+
+count_20_locations_by_ward <- top_20_locations_geocoded %>%
+  group_by(AREA_NAME) %>%
+  summarise(count=sum(freq)) %>%
+  select(AREA_NAME,count) %>%
+  right_join(sf_city_ward,by='AREA_NAME') %>%
+  select(AREA_NAME,count,geometry) %>%
+  replace(is.na(.), 0)
+
+# Finally, plot it out
+
+unique_color_df <- data.frame(count = sort(unique(count_20_locations_by_ward$count)),
+                              color = gsub(".{2}$","",topo.colors(length(unique(count_20_locations_by_ward$count)))))
+
+colors <- unique_color_df %>% 
+  right_join(count_20_locations_by_ward,by='count') %>% 
+  select(color)
+colors <-  as.vector(as.character(colors[,1]))
+
+leaflet(sf_city_ward) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  setView(lng = -79.372573, lat = 43.679434, zoom = 10) %>%
+  addPolygons(data = count_20_locations_by_ward$geometry, weight = 2,
+              popup = paste('Area:',count_20_locations_by_ward$AREA_NAME, "<br>",
+                            'Count:',count_20_locations_by_ward$count, "<br>"),
+              fillColor = colors) %>%
+  addLegend(position = 'bottomright',
+            colors=unique_color_df$color,
+            labels=unique_color_df$count,
+            title='Count for top 20 infractions')
+```
+
+
+### 3.3.2.c Geographic distribution by ward for top 20 infractions (revenue)
+### Interpretation: find the revenue of infractions within each ward and find the top 20 wards
+
+```{r}
+# First retrieve aggregated sum revenues per location
+revenue_df <- parking_ticket[(parking_ticket$location2 %in% top_20_locations_geocoded$location2),] %>%
+  group_by(location2) %>%
+  summarise(revenue=sum(set_fine_amount)) %>%
+  as.data.frame() %>%
+  right_join(top_20_locations_geocoded,by='location2')
+
+# Then create a table with summed revenue
+
+revenue_20_locations_by_ward <- revenue_df %>%
+  group_by(AREA_NAME) %>%
+  summarise(sum=sum(revenue)) %>%
+  select(AREA_NAME,sum) %>%
+  right_join(sf_city_ward,by='AREA_NAME') %>%
+  select(AREA_NAME,sum,geometry) %>%
+  replace(is.na(.), 0)
+
+# Finally, plot it out
+
+unique_color_df <- data.frame(sum = sort(unique(revenue_20_locations_by_ward$sum)),
+                              color = gsub(".{2}$","",topo.colors(length(unique(revenue_20_locations_by_ward$sum)))))
+
+colors <- unique_color_df %>% 
+  right_join(revenue_20_locations_by_ward,by=c('sum')) %>% 
+  select(color)
+colors <-  as.vector(as.character(colors[,1]))
+
+leaflet(sf_city_ward) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  setView(lng = -79.372573, lat = 43.679434, zoom = 10) %>%
+  addPolygons(data = revenue_20_locations_by_ward$geometry, weight = 2,
+              popup = paste('Area:',revenue_20_locations_by_ward$AREA_NAME, "<br>",
+                            'Count:',revenue_20_locations_by_ward$sum, "<br>"),
+              fillColor = colors) %>%
+  addLegend(position = 'bottomright',
+            colors=unique_color_df$color,
+            labels=unique_color_df$sum,
+            title='Revenue for top 20 infractions')
+```
